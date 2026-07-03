@@ -650,6 +650,28 @@ let pageIdx = 0;  // 0～4
 let idxInPage = 0;  // 0～8
 const answers = new Array(total).fill(null);
 
+// ===== Googleスプレッドシート連携 =====
+// Apps Script のデプロイURLをここに貼り付ける（例: "https://script.google.com/macros/s/xxxx/exec"）
+// 未設定（空文字）の間は送信をスキップする。
+const GAS_ENDPOINT = "https://script.google.com/macros/s/AKfycbyQT-y7yixK_jiS8POkVK4G3ZgXfNcUoHvh6atZ5K731E2ADPYIT7Zbwo4dNrASQVqFWA/exec";
+
+function sendResultToSheet(payload){
+  if(!GAS_ENDPOINT){
+    console.warn('[建築学科版MBTI] GAS_ENDPOINT が未設定のため、スプレッドシートへの送信はスキップされました。');
+    return;
+  }
+  // Apps Script Web AppはCORSプリフライトに正しく応答しないため、
+  // no-cors + text/plain で送信する（レスポンス内容は読めないが送信自体は成功する）
+  fetch(GAS_ENDPOINT, {
+    method: 'POST',
+    mode: 'no-cors',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  }).catch(err=>{
+    console.error('[建築学科版MBTI] スプレッドシートへの送信に失敗しました:', err);
+  });
+}
+
 // ページ内の ruler（9問分）を作成
 const ruler = document.getElementById('ruler');
 for(let i=0; i<QUESTIONS_PER_PAGE; i++){
@@ -746,14 +768,23 @@ document.getElementById('qlist').addEventListener('click', (e)=>{
 });
 
 function showResult(){
-  // 軸ごとに poleLeft / poleRight 方向のスコアを 0-9 で集計
+  // 軸ごとに poleLeft / poleRight 方向のスコアを集計
+  // 「3」（中立回答）は中心化バイアスの影響を強く受けるため、軸スコアの計算から除外する。
+  // 除外後の回答のみで rightRatio/leftRatio を計算し、実効的な軸スコアを求める。
   const scores = {}; // scores[axisKey] = { [poleLetter]: sum }
+  const excludedCount = {}; // 軸ごとの「3」除外数（デバッグ・表示用）
   Object.keys(DATA.axes).forEach(ax=>{
     scores[ax] = {};
+    excludedCount[ax] = 0;
   });
 
   Q.forEach((q, i)=>{
     const v = answers[i] ?? 3; // 未回答が万一あれば中立(3)として扱う
+    if(v === 3){
+      // 中立回答は軸スコアの計算に含めない（3除外方式）
+      excludedCount[q.axis] = (excludedCount[q.axis]||0) + 1;
+      return;
+    }
     const rightRatio = (v-1)/4; // 0..1 -> 右極への近さ
     const leftRatio = 1-rightRatio;
     scores[q.axis][q.left.pole] = (scores[q.axis][q.left.pole]||0) + leftRatio;
@@ -761,6 +792,7 @@ function showResult(){
   });
 
   let code = '';
+  const axisPctLog = {}; // 各軸の右極%を記録（スプレッドシート送信用）
   const axisList = document.getElementById('axisList');
   axisList.innerHTML = '';
 
@@ -769,11 +801,13 @@ function showResult(){
     const L = axis.poleLeft, R = axis.poleRight;
     const sL = scores[axKey][L]||0;
     const sR = scores[axKey][R]||0;
-    const totalQ = sL + sR; // = 9
-    const pctR = Math.round((sR/totalQ)*100);
+    const totalQ = sL + sR; // 3除外後の実効設問数（最大9、全問「3」の場合は0）
+    // 全問「3」だった場合（totalQ===0）は判定不能のため、便宜上50/50（左極寄り）として扱う
+    const pctR = totalQ > 0 ? Math.round((sR/totalQ)*100) : 50;
     const pctL = 100-pctR;
-    const winner = sR >= sL ? R : L;
+    const winner = totalQ > 0 ? (sR >= sL ? R : L) : L;
     code += winner;
+    axisPctLog[axKey] = pctR; // R極への%を記録（分析用。Lなら100-pctR）
 
     const winnerLabel = winner === R ? axis.labelRight : axis.labelLeft;
     const winnerPct = winner === R ? pctR : pctL;
@@ -801,6 +835,14 @@ function showResult(){
 
   document.getElementById('typeNameBig').textContent = typeInfo.name;
   document.getElementById('codeStamp').textContent = `${baseKey}-${styleLetter}`;
+
+  // 結果をGoogleスプレッドシートに記録（失敗しても診断結果の表示は継続する）
+  sendResultToSheet({
+    typeCode: `${baseKey}-${styleLetter}`,
+    typeName: typeInfo.name,
+    axisPct: axisPctLog,
+    rawAnswers: answers
+  });
 
   const portraitEl = document.getElementById('typePortrait');
   const portraitWrap = document.getElementById('portraitWrap');
